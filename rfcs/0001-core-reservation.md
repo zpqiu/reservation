@@ -10,6 +10,13 @@ enum ReservationStatus {
     BLOCKED = 3;
 }
 
+enum ReservationUpdateType {
+    UNKNOWN = 0;
+    CREATE = 1;
+    UPDATE = 2;
+    DELETE = 3;
+}
+
 message Reservation {
     string id = 1;
     string user_id = 2;
@@ -72,7 +79,11 @@ message QueryRequest {
 }
 
 message ListenRequest {
-    repeated
+}
+
+message ListenResponse {
+    int8 op = 1;
+    Reservation reservation = 2;
 }
 
 service ReservationService {
@@ -91,6 +102,8 @@ service ReservationService {
 CREATE SCHEMA rsvp;
 CREATE TYPE rsvp.reservation_status AS ENUM
 ('unknown', 'pending', 'confirmed', 'blocked');
+CREATE TYPE rsvp.reservation_update_type as ENUM
+('unknown', 'create', 'update', 'delete');
 
 CREATE TABLE rsvp.reservations (
     id uuid NOT NULL DEFAULT uuid_generate_v4(),
@@ -111,11 +124,39 @@ CREATE INDEX reservations_user_id_idx ON rsvp.reservation (user_id);
 CREATE OR REPLACE FUNCTION rsvp.query(uid text, rid text, during: tstzrange)
 RETURNS TABLE rsvp.reservations AS $$ $$ LANGUAGE plpgsql;
 
+-- reservation change queue
+CREATE TABLE rsvp.reservation_chanes (
+    id SERIAL NOT NULL,
+    reservation_id uuid NOT NULL,
+    op rsvp.reservation_update_type NOT NULL,
+)
+
 CREATE OR REPLACE FUNCTION rsvp.reservations_trigger() RETURNS TRIGGER
 AS
 $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
+        -- update reservation_changes
+        INSERT INTO rsvp.reservation_changes (reservation_id, op) VALUES
+        (NEW.id, 'create');
+        -- check if the reservation conflicts with existing reservations
+        -- send notification to the reservation service
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- check if the reservation is valid
+        IF OLD.status <> NEW.status THEN
+            INSERT INTO rsvp.reservation_changes (reservation_id, op) VALUES
+            (NEW.id, 'update');
+        END IF;
+        -- check if the reservation conflicts with existing reservations
+        -- send notification to the reservation service
+    ELSIF TG_OP = 'DELETE' THEN
+        INSERT INTO rsvp.reservation_changes (reservation_id, op) VALUES
+        (NEW.id, 'delete');
+        -- send notification to the reservation service
+    END IF;
+    -- notify a channel called reservation_update
+    NOTIFY reservation_update;
+    RETURN NULL;
 END
 $$ LANGUAGE plpgsql;
 
